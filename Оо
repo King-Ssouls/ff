@@ -1,0 +1,667 @@
+import os
+import re
+import secrets
+import sqlite3
+from contextlib import contextmanager
+from datetime import date
+from functools import wraps
+from pathlib import Path
+
+from flask import (
+    Flask, abort, flash, g, redirect,
+    render_template, request, session, url_for
+)
+from werkzeug.security import (
+    check_password_hash,
+    generate_password_hash,
+)
+
+
+class Database:
+    def __init__(self, path):
+        self.path = path
+
+    @contextmanager
+    def connect(self):
+        connection = sqlite3.connect(self.path)
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA foreign_keys = ON")
+
+        try:
+            with connection:
+                yield connection
+        finally:
+            connection.close()
+
+    def all(self, sql, params=()):
+        with self.connect() as connection:
+            return [
+                dict(row)
+                for row in connection.execute(sql, params)
+            ]
+
+    def one(self, sql, params=()):
+        rows = self.all(sql, params)
+        return rows[0] if rows else None
+
+    def run(self, sql, params=()):
+        with self.connect() as connection:
+            return connection.execute(sql, params).lastrowid
+
+    def initialize(self):
+        with self.connect() as connection:
+            connection.executescript("""
+                CREATE TABLE IF NOT EXISTS users (
+                    id INTEGER PRIMARY KEY,
+                    full_name TEXT NOT NULL,
+                    birth_date TEXT NOT NULL,
+                    phone TEXT NOT NULL,
+                    email TEXT NOT NULL,
+                    login TEXT NOT NULL COLLATE NOCASE UNIQUE,
+                    password_hash TEXT NOT NULL,
+                    role TEXT NOT NULL DEFAULT 'user'
+                        CHECK(role IN ('user', 'admin'))
+                );
+
+                CREATE TABLE IF NOT EXISTS transports (
+                    id INTEGER PRIMARY KEY,
+                    code TEXT NOT NULL UNIQUE,
+                    name TEXT NOT NULL,
+                    image TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS payments (
+                    id INTEGER PRIMARY KEY,
+                    code TEXT NOT NULL UNIQUE,
+                    name TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS statuses (
+                    id INTEGER PRIMARY KEY,
+                    code TEXT NOT NULL UNIQUE,
+                    name TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS applications (
+                    id INTEGER PRIMARY KEY,
+                    user_id INTEGER NOT NULL REFERENCES users(id),
+                    transport_id INTEGER NOT NULL
+                        REFERENCES transports(id),
+                    start_date TEXT NOT NULL,
+                    payment_id INTEGER NOT NULL REFERENCES payments(id),
+                    status_id INTEGER NOT NULL REFERENCES statuses(id),
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
+
+                CREATE TABLE IF NOT EXISTS reviews (
+                    id INTEGER PRIMARY KEY,
+                    application_id INTEGER NOT NULL UNIQUE
+                        REFERENCES applications(id) ON DELETE CASCADE,
+                    text TEXT NOT NULL,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
+            """)
+
+            connection.executemany(
+                "INSERT OR IGNORE INTO transports VALUES (?, ?, ?, ?)",
+                [
+                    (1, "bus", "Автобус", "bus.jpg"),
+                    (2, "electricbus", "Электробус", "electricbus.webp"),
+                    (3, "tram", "Трамвай", "tram.webp"),
+                ],
+            )
+
+            connection.executemany(
+                "INSERT OR IGNORE INTO payments VALUES (?, ?, ?)",
+                [
+                    (1, "card", "Банковская карта"),
+                    (2, "cash", "Наличные"),
+                ],
+            )
+
+            connection.executemany(
+                "INSERT OR IGNORE INTO statuses VALUES (?, ?, ?)",
+                [
+                    (1, "new", "Новая"),
+                    (2, "training", "Идет обучение"),
+                    (3, "completed", "Обучение завершено"),
+                ],
+            )
+
+            for login, password, role in [
+                ("Admin26", "Demo20", "admin"),
+                ("Ivanov26", "Demo2026", "user"),
+            ]:
+                existing = connection.execute(
+                    "SELECT id FROM users WHERE login = ?",
+                    (login,),
+                ).fetchone()
+
+                if existing:
+                    continue
+
+                cursor = connection.execute("""
+                    INSERT INTO users
+                    (
+                        full_name, birth_date, phone, email,
+                        login, password_hash, role
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    "Администратор" if role == "admin"
+                    else "Иванов Иван Иванович",
+                    "1999-01-01",
+                    "+7 900 123-45-67",
+                    "demo@example.com",
+                    login,
+                    generate_password_hash(password),
+                    role,
+                ))
+
+                if role == "user":
+                    connection.executemany("""
+                        INSERT INTO applications
+                        (
+                            user_id, transport_id, start_date,
+                            payment_id, status_id
+                        )
+                        VALUES (?, ?, ?, ?, ?)
+                    """, [
+                        (cursor.lastrowid, 1, "2026-11-01", 1, 1),
+                        (cursor.lastrowid, 2, "2026-10-01", 2, 2),
+                        (cursor.lastrowid, 3, "2026-08-01", 1, 3),
+                    ])
+
+
+BASE = Path(__file__).resolve().parent
+
+DATA = Path(
+    os.environ.get("PASSENGERS_DATA_DIR", str(BASE / "data"))
+)
+DATA.mkdir(parents=True, exist_ok=True)
+
+key_file = DATA / "secret.key"
+
+if not key_file.exists():
+    key_file.write_text(
+        secrets.token_hex(32),
+        encoding="utf-8",
+    )
+
+app = Flask(__name__)
+
+app.config.update(
+    SECRET_KEY=(
+        os.environ.get("SECRET_KEY")
+        or key_file.read_text().strip()
+    ),
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE="Lax",
+    MAX_CONTENT_LENGTH=16384,
+)
+
+db = Database(DATA / "database.db")
+db.initialize()
+
+
+def current_user():
+    return db.one(
+        """
+        SELECT id, full_name, login, role
+        FROM users
+        WHERE id = ?
+        """,
+        (session.get("user_id"),),
+    )
+
+
+@app.context_processor
+def common_data():
+    session.setdefault("csrf", secrets.token_hex(32))
+
+    return {
+        "current_user": current_user(),
+        "csrf_token": session["csrf"],
+        "today": date.today().isoformat(),
+    }
+
+
+@app.before_request
+def protect_forms():
+    if request.method == "POST":
+        token = session.get("csrf", "")
+
+        if not token or not secrets.compare_digest(
+            token,
+            request.form.get("csrf_token", ""),
+        ):
+            abort(
+                400,
+                "Обновите страницу и повторите отправку формы.",
+            )
+
+
+def require_login(admin=False):
+    def decorate(view):
+        @wraps(view)
+        def wrapped(*args, **kwargs):
+            g.user = current_user()
+
+            if not g.user:
+                return redirect(url_for("login_page"))
+
+            if admin and g.user["role"] != "admin":
+                abort(
+                    403,
+                    "Доступ только для администратора.",
+                )
+
+            return view(*args, **kwargs)
+
+        return wrapped
+
+    return decorate
+
+
+def parse_date(value):
+    try:
+        return date.fromisoformat(value)
+    except (ValueError, TypeError):
+        raise ValueError("Укажите корректную дату.")
+
+
+@app.template_filter("date_ru")
+def date_ru(value):
+    return date.fromisoformat(value).strftime("%d.%m.%Y")
+
+
+@app.route("/register", methods=["GET", "POST"])
+def register_page():
+    if request.method == "POST":
+        form = request.form
+
+        name = form.get("full_name", "").strip()
+        phone = form.get("phone", "").strip()
+        email = form.get("email", "").strip()
+        login = form.get("login", "").strip()
+        password = form.get("password", "")
+
+        try:
+            birthday = parse_date(
+                form.get("birth_date", "")
+            )
+
+            if not name or len(name) > 200:
+                raise ValueError(
+                    "Укажите ФИО длиной до 200 символов."
+                )
+
+            if not re.fullmatch(
+                r"(?=.*[A-Za-z])(?=.*\d)[A-Za-z0-9]{6,50}",
+                login,
+            ):
+                raise ValueError(
+                    "Логин: 6–50 символов, "
+                    "латинские буквы и цифры."
+                )
+
+            if not 8 <= len(password) <= 128:
+                raise ValueError(
+                    "Пароль должен содержать "
+                    "от 8 до 128 символов."
+                )
+
+            if birthday > date.today():
+                raise ValueError(
+                    "Дата рождения не может быть в будущем."
+                )
+
+            if not re.fullmatch(
+                r"[+()0-9\s-]+",
+                phone,
+            ) or not (
+                7 <= len(re.sub(r"\D", "", phone)) <= 15
+            ):
+                raise ValueError(
+                    "Укажите корректный телефон."
+                )
+
+            if len(email) > 254 or not re.fullmatch(
+                r"[^@\s]+@[^@\s]+\.[^@\s]+",
+                email,
+            ):
+                raise ValueError(
+                    "Укажите корректную электронную почту."
+                )
+
+            db.run("""
+                INSERT INTO users
+                (
+                    full_name, birth_date, phone,
+                    email, login, password_hash
+                )
+                VALUES (?, ?, ?, ?, ?, ?)
+            """, (
+                name,
+                birthday.isoformat(),
+                phone,
+                email,
+                login,
+                generate_password_hash(password),
+            ))
+
+        except ValueError as error:
+            flash(str(error), "error")
+
+        except sqlite3.IntegrityError:
+            flash("Этот логин уже занят.", "error")
+
+        else:
+            flash(
+                "Регистрация завершена. Войдите в аккаунт.",
+                "success",
+            )
+            return redirect(url_for("login_page"))
+
+    return render_template("register.html")
+
+
+@app.route("/", methods=["GET", "POST"])
+@app.route("/login", methods=["GET", "POST"])
+def login_page():
+    if request.method == "POST":
+        user = db.one(
+            "SELECT * FROM users WHERE login = ?",
+            (request.form.get("login", "").strip(),),
+        )
+
+        password = request.form.get("password", "")
+
+        if (
+            user
+            and len(password) <= 128
+            and check_password_hash(
+                user["password_hash"],
+                password,
+            )
+        ):
+            session.clear()
+            session["user_id"] = user["id"]
+
+            return redirect(url_for(
+                "admin_page"
+                if user["role"] == "admin"
+                else "profile_page"
+            ))
+
+        flash(
+            "Неверный логин или пароль.",
+            "error",
+        )
+
+    return render_template("login.html")
+
+
+@app.post("/logout")
+def logout():
+    session.clear()
+    flash("Вы вышли из аккаунта.", "success")
+
+    return redirect(url_for("login_page"))
+
+
+JOIN = """
+    FROM applications a
+    JOIN users u ON u.id = a.user_id
+    JOIN transports t ON t.id = a.transport_id
+    JOIN payments p ON p.id = a.payment_id
+    JOIN statuses s ON s.id = a.status_id
+    LEFT JOIN reviews r ON r.application_id = a.id
+"""
+
+SELECT = """
+    SELECT
+        a.id, a.start_date, a.created_at,
+        u.full_name, u.phone, u.email,
+        t.name AS transport, t.image,
+        p.name AS payment,
+        s.id AS status_id,
+        s.name AS status,
+        s.code AS status_code,
+        r.text AS review
+"""
+
+
+@app.get("/profile")
+@require_login()
+def profile_page():
+    items = db.all(
+        SELECT + JOIN
+        + " WHERE a.user_id = ? ORDER BY a.id DESC",
+        (g.user["id"],),
+    )
+
+    return render_template(
+        "profile.html",
+        applications=items,
+    )
+
+
+@app.route("/application", methods=["GET", "POST"])
+@require_login()
+def application_page():
+    if request.method == "POST":
+        try:
+            start = parse_date(
+                request.form.get("start_date", "")
+            )
+
+            if start < date.today():
+                raise ValueError(
+                    "Выберите сегодняшнюю или будущую дату."
+                )
+
+            transport = db.one(
+                "SELECT id FROM transports WHERE code = ?",
+                (request.form.get("transport"),),
+            )
+
+            payment = db.one(
+                "SELECT id FROM payments WHERE code = ?",
+                (request.form.get("payment"),),
+            )
+
+            if not transport or not payment:
+                raise ValueError(
+                    "Выберите транспорт и способ оплаты."
+                )
+
+            status = db.one(
+                "SELECT id FROM statuses WHERE code = 'new'"
+            )
+
+            db.run("""
+                INSERT INTO applications
+                (
+                    user_id, transport_id, start_date,
+                    payment_id, status_id
+                )
+                VALUES (?, ?, ?, ?, ?)
+            """, (
+                g.user["id"],
+                transport["id"],
+                start.isoformat(),
+                payment["id"],
+                status["id"],
+            ))
+
+        except ValueError as error:
+            flash(str(error), "error")
+
+        else:
+            flash("Заявка создана.", "success")
+
+            return redirect(
+                url_for("profile_page")
+            )
+
+    return render_template(
+        "application.html",
+        transports=db.all(
+            "SELECT * FROM transports ORDER BY id"
+        ),
+        payments=db.all(
+            "SELECT * FROM payments ORDER BY id"
+        ),
+    )
+
+
+@app.post("/applications/<int:application_id>/review")
+@require_login()
+def save_review(application_id):
+    item = db.one(
+        SELECT + JOIN
+        + " WHERE a.id = ? AND a.user_id = ?",
+        (application_id, g.user["id"]),
+    )
+
+    if not item:
+        abort(404)
+
+    review = request.form.get("review", "").strip()
+
+    if item["status_code"] == "new":
+        flash(
+            "Отзыв доступен после изменения "
+            "статуса администратором.",
+            "error",
+        )
+
+    elif not review or len(review) > 1000:
+        flash(
+            "Отзыв должен содержать "
+            "от 1 до 1000 символов.",
+            "error",
+        )
+
+    else:
+        db.run("""
+            INSERT INTO reviews (application_id, text)
+            VALUES (?, ?)
+            ON CONFLICT(application_id)
+            DO UPDATE SET text = excluded.text
+        """, (application_id, review))
+
+        flash("Отзыв сохранён.", "success")
+
+    return redirect(url_for("profile_page"))
+
+
+@app.get("/admin")
+@require_login(admin=True)
+def admin_page():
+    conditions = []
+    params = []
+
+    if status := request.args.get("status", ""):
+        conditions.append("s.code = ?")
+        params.append(status)
+
+    if query := request.args.get("q", "").strip():
+        conditions.append(
+            "(u.full_name LIKE ? OR t.name LIKE ?)"
+        )
+        params.extend([f"%{query}%"] * 2)
+
+    where = (
+        " WHERE " + " AND ".join(conditions)
+        if conditions else ""
+    )
+
+    order = {
+        "newest": "a.id DESC",
+        "oldest": "a.id ASC",
+        "start": "a.start_date ASC, a.id DESC",
+        "name": "u.full_name ASC, a.id DESC",
+    }.get(
+        request.args.get("sort"),
+        "a.id DESC",
+    )
+
+    total = db.one(
+        "SELECT COUNT(*) AS n " + JOIN + where,
+        params,
+    )["n"]
+
+    pages = max(1, (total + 4) // 5)
+
+    page = request.args.get(
+        "page",
+        1,
+        type=int,
+    ) or 1
+
+    page = max(1, min(page, pages))
+
+    items = db.all(
+        SELECT + JOIN + where
+        + f" ORDER BY {order} LIMIT 5 OFFSET ?",
+        (*params, (page - 1) * 5),
+    )
+
+    return render_template(
+        "admin.html",
+        applications=items,
+        page=page,
+        pages=pages,
+        total=total,
+        statuses=db.all(
+            "SELECT * FROM statuses ORDER BY id"
+        ),
+    )
+
+
+@app.post(
+    "/admin/applications/<int:application_id>/status"
+)
+@require_login(admin=True)
+def update_status(application_id):
+    status_id = request.form.get(
+        "status_id",
+        type=int,
+    )
+
+    if not db.one(
+        "SELECT id FROM statuses WHERE id = ?",
+        (status_id,),
+    ):
+        abort(400, "Некорректный статус.")
+
+    if not db.one(
+        "SELECT id FROM applications WHERE id = ?",
+        (application_id,),
+    ):
+        abort(404)
+
+    db.run(
+        """
+        UPDATE applications
+        SET status_id = ?
+        WHERE id = ?
+        """,
+        (status_id, application_id),
+    )
+
+    flash("Статус обновлён.", "success")
+
+    return redirect(url_for(
+        "admin_page",
+        q=request.form.get("q", ""),
+        status=request.form.get("filter_status", ""),
+        sort=request.form.get("sort", "newest"),
+        page=request.form.get("page", 1, type=int),
+    ))
+
+
+if __name__ == "__main__":
+    app.run(debug=True)
